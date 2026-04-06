@@ -248,13 +248,13 @@ class IrishTaxCalculator:
             (0.0, max_cycle)
         ]
         
-        x0 = [0.0, 0.0, 0.0]
+        x0 = [10.0, 10.0, 10.0]
         
         res = minimize(
             lambda x: self._objective_function(x, utility_weight_pension, utility_weight_voucher, utility_weight_cycle), 
             x0,
             bounds=bounds,
-            method='L-BFGS-B'
+            method='Powell'
         )
         
         if res.success:
