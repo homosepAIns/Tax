@@ -14,6 +14,7 @@ class IrishTaxCalculator:
         pension_contribution: float = 0.0,
         voucher_allocation: float = 0.0,
         cycle_to_work: float = 0.0,
+        travel_pass: float = 0.0,
         cycle_type: str = "regular",
         cycle_to_work_mode: str = "annual",
         bik: float = 0.0,
@@ -35,6 +36,7 @@ class IrishTaxCalculator:
         self.pension_contribution = pension_contribution
         self.voucher_allocation = voucher_allocation
         self.cycle_to_work = cycle_to_work
+        self.travel_pass = travel_pass
         self.cycle_type = cycle_type
         self.cycle_to_work_mode = cycle_to_work_mode
         self.bik = bik
@@ -166,7 +168,8 @@ class IrishTaxCalculator:
             
         cfg = self._get_tax_config()
         
-        taxable_base = max(0, self.gross_income - self.voucher_allocation - self.cycle_to_work)
+        # Shield variables cleanly off the top
+        taxable_base = max(0, self.gross_income - self.voucher_allocation - self.cycle_to_work - self.travel_pass)
         
         total_income_for_prsi_usc = taxable_base + self.bik
         taxable_paye_income = max(0, total_income_for_prsi_usc - self.pension_contribution)
@@ -195,6 +198,7 @@ class IrishTaxCalculator:
                 "Gross Compensatory Value": self.gross_income,
                 "Voucher Allocation": self.voucher_allocation,
                 "Cycle to Work": self.cycle_to_work,
+                "Travel Pass": self.travel_pass,
                 "Pension Deduction": self.pension_contribution,
                 "Benefits In Kind (BIK)": self.bik,
             },
@@ -205,7 +209,8 @@ class IrishTaxCalculator:
                 "USC": round(usc, 2),
                 "PRSI": round(prsi, 2),
                 "Rent Tax Credit": round(self.rent_tax_credit, 2),
-                "Cycle to Work": round(self.cycle_to_work, 2)
+                "Cycle to Work": round(self.cycle_to_work, 2),
+                "Travel Pass": round(self.travel_pass, 2)
             },
             "Summary": {
                 "Total Tax Deduced": round(total_taxes, 2),
@@ -217,15 +222,16 @@ class IrishTaxCalculator:
 
     def _build_empty_response(self) -> dict:
         return {
-            "Core Financials": {"Gross Compensatory Value": 0.0, "Voucher Allocation": 0.0, "Cycle to Work": 0.0, "Pension Deduction": 0.0, "Benefits In Kind (BIK)": 0.0},
-            "Tax Deductions": {"Gross Income Tax": 0.0, "Tax Credits Applied": 0.0, "Net Income Tax (PAYE)": 0.0, "USC": 0.0, "PRSI": 0.0, "Rent Tax Credit": 0.0, "Cycle to Work": 0.0},
+            "Core Financials": {"Gross Compensatory Value": 0.0, "Voucher Allocation": 0.0, "Cycle to Work": 0.0, "Travel Pass": 0.0, "Pension Deduction": 0.0, "Benefits In Kind (BIK)": 0.0},
+            "Tax Deductions": {"Gross Income Tax": 0.0, "Tax Credits Applied": 0.0, "Net Income Tax (PAYE)": 0.0, "USC": 0.0, "PRSI": 0.0, "Rent Tax Credit": 0.0, "Cycle to Work": 0.0, "Travel Pass": 0.0},
             "Summary": {"Total Tax Deduced": 0.0, "Take Home CASH": 0.0, "Effective Tax Rate (%)": 0.0, "Marginal Tax Rate (%)": 0.0}
         }
 
-    def _objective_function(self, x, utility_weight_pension: float, utility_weight_voucher: float, utility_weight_cycle: float) -> float:
+    def _objective_function(self, x, utility_weight_pension: float, utility_weight_voucher: float, utility_weight_cycle: float, utility_weight_travel: float) -> float:
         self.pension_contribution = x[0]
         self.voucher_allocation = x[1]
         self.cycle_to_work = x[2]
+        self.travel_pass = x[3]
         
         result = self.calculate()
         take_home_cash = result["Summary"]["Take Home CASH"]
@@ -233,25 +239,28 @@ class IrishTaxCalculator:
         utility_pension = utility_weight_pension * self.pension_contribution
         utility_voucher = utility_weight_voucher * self.voucher_allocation
         utility_cycle = utility_weight_cycle * self.cycle_to_work
+        utility_travel = utility_weight_travel * self.travel_pass
         
-        total_utility = take_home_cash + utility_pension + utility_voucher + utility_cycle
+        total_utility = take_home_cash + utility_pension + utility_voucher + utility_cycle + utility_travel
         return -total_utility
 
-    def optimize(self, utility_weight_pension=1.2, utility_weight_voucher=0.90, utility_weight_cycle=0.85):
+    def optimize(self, utility_weight_pension=1.2, utility_weight_voucher=0.90, utility_weight_cycle=0.85, utility_weight_travel=0.95):
         max_pension = self.get_max_pension_limit()
         max_voucher = 1000.0  
         max_cycle = self.get_max_cycle_to_work_limit()
+        max_travel = 1830.0  # Max travel pass exclusion currently around this bracket
         
         bounds = [
             (0.0, max_pension),
             (0.0, max_voucher),
-            (0.0, max_cycle)
+            (0.0, max_cycle),
+            (0.0, max_travel)
         ]
         
-        x0 = [10.0, 10.0, 10.0]
+        x0 = [10.0, 10.0, 10.0, 10.0]
         
         res = minimize(
-            lambda x: self._objective_function(x, utility_weight_pension, utility_weight_voucher, utility_weight_cycle), 
+            lambda x: self._objective_function(x, utility_weight_pension, utility_weight_voucher, utility_weight_cycle, utility_weight_travel), 
             x0,
             bounds=bounds,
             method='Powell'
@@ -261,6 +270,7 @@ class IrishTaxCalculator:
             self.pension_contribution = res.x[0]
             self.voucher_allocation = res.x[1]
             self.cycle_to_work = res.x[2]
+            self.travel_pass = res.x[3]
             final_result = self.calculate()
             
             print(json.dumps(final_result, indent=4))
@@ -269,9 +279,11 @@ class IrishTaxCalculator:
             print(f"Optimal Pension Allocation: €{round(self.pension_contribution, 2)} (Bound: €{round(max_pension,2)})")
             print(f"Optimal Voucher Allocation: €{round(self.voucher_allocation, 2)} (Bound: €{round(max_voucher,2)})")
             print(f"Optimal Cycle to Work Allocation: €{round(self.cycle_to_work, 2)} (Bound: €{round(max_cycle,2)})")
+            print(f"Optimal Travel Pass Allocation: €{round(self.travel_pass, 2)} (Bound: €{round(max_travel,2)})")
             print(f"- Pension utility metric: {utility_weight_pension}")
             print(f"- Voucher utility metric: {utility_weight_voucher}")
             print(f"- Cycle utility metric: {utility_weight_cycle}")
+            print(f"- Travel pass utility metric: {utility_weight_travel}")
             print("="*50 + "\n")
         else:
             print("Bounded multidimensional optimization failed.")
@@ -282,10 +294,12 @@ class IrishTaxCalculator:
         original_pension = self.pension_contribution
         original_voucher = self.voucher_allocation
         original_cycle = self.cycle_to_work
+        original_travel = self.travel_pass
         
         self.pension_contribution = 0.0
         self.voucher_allocation = 0.0
         self.cycle_to_work = 0.0
+        self.travel_pass = 0.0
         
         income_pts = [float(x) for x in range(int(step), int(max_income) + int(step), int(step))]
         
@@ -315,6 +329,7 @@ class IrishTaxCalculator:
         self.pension_contribution = original_pension
         self.voucher_allocation = original_voucher
         self.cycle_to_work = original_cycle
+        self.travel_pass = original_travel
         return curve
 
     def print_marginal_curve(self, max_income: float = 120_000, step: float = 1_000):
@@ -328,14 +343,13 @@ class IrishTaxCalculator:
 
 if __name__ == "__main__":
     
-    # Instantiate the calculator matching the test conditions exactly:
-    # gross_income=49000, age=24, cycle_type="ebike", cycle_to_work_mode="annual"
     calc = IrishTaxCalculator(
         gross_income=49000.0,
         age=24,
         pension_contribution=0.0,
         voucher_allocation=0.0,
         cycle_to_work=0.0,
+        travel_pass=0.0,
         cycle_type="ebike",
         cycle_to_work_mode="annual",
         bik=0.0,
@@ -345,6 +359,5 @@ if __name__ == "__main__":
         rent_tax_credit=1000.0
     )
 
-    # Call the multidimensional utility optimizer to evaluate the 3D surface parameters
-    calc.optimize(utility_weight_pension=1.2, utility_weight_voucher=0.90, utility_weight_cycle=0.85)
-
+    # Note: Using high utility weights to show boundary locking
+    calc.optimize(utility_weight_pension=1.2, utility_weight_voucher=0.90, utility_weight_cycle=0.85, utility_weight_travel=0.0)
