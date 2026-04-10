@@ -18,6 +18,7 @@ class IrishTaxCalculator:
         cycle_type: str = "regular",
         cycle_to_work_mode: str = "annual",
         bik: float = 0.0,
+        employer_health_premium: float = 0.0,
         employment_type: str = "PAYE",
         marital_status: str = "Single",
         age: int = 30,
@@ -25,7 +26,18 @@ class IrishTaxCalculator:
         additional_tax_credits: float = 0.0,
         tax_year: int = 2026,
         second_income: float = 0.0,
-        rent_tax_credit: float = 0.0
+        annual_rent_paid: float = 0.0,
+        is_blind: bool = False,
+        has_incapacitated_child: bool = False,
+        claims_home_carer: bool = False,
+        claims_single_child_carer: bool = False,
+        claims_dependent_relative: bool = False,
+        widowed_years_since: int = -1,
+        rent_a_room_income: float = 0.0,
+        micro_generation_income: float = 0.0,
+        qualifying_health_expenses: float = 0.0,
+        eiis_investment: float = 0.0,
+        deeds_of_covenant: float = 0.0
     ):
         """
         :param tax_year: Year for tax rules (2025 or 2026).
@@ -40,6 +52,7 @@ class IrishTaxCalculator:
         self.cycle_type = cycle_type
         self.cycle_to_work_mode = cycle_to_work_mode
         self.bik = bik
+        self.employer_health_premium = employer_health_premium
         self.employment_type = employment_type
         self.marital_status = marital_status
         self.age = age
@@ -47,14 +60,33 @@ class IrishTaxCalculator:
         self.additional_tax_credits = additional_tax_credits
         self.tax_year = tax_year
         self.second_income = second_income
-        self.rent_tax_credit = rent_tax_credit
+        self.annual_rent_paid = annual_rent_paid
+        self.is_blind = is_blind
+        self.has_incapacitated_child = has_incapacitated_child
+        self.claims_home_carer = claims_home_carer
+        self.claims_single_child_carer = claims_single_child_carer
+        self.claims_dependent_relative = claims_dependent_relative
+        self.widowed_years_since = widowed_years_since
+        self.rent_a_room_income = rent_a_room_income
+        self.micro_generation_income = micro_generation_income
+        self.qualifying_health_expenses = qualifying_health_expenses
+        self.eiis_investment = eiis_investment
+        self.deeds_of_covenant = deeds_of_covenant
 
     def _get_tax_config(self) -> dict:
         """Returns tax configurations dynamically based on the active tax_year."""
         cfg = {
             "PERSONAL_CREDIT": 2000.0,
             "EMPLOYMENT_CREDIT": 2000.0, 
+            "EARNED_INCOME_CREDIT": 2000.0,
             "AGE_CREDIT_SINGLE": 245.0,
+            "AGE_CREDIT_MARRIED": 490.0,
+            "BLIND_CREDIT_SINGLE": 1950.0,
+            "BLIND_CREDIT_MARRIED": 3900.0,
+            "INCAPACITATED_CHILD_CREDIT": 3800.0,
+            "DEPENDENT_RELATIVE_CREDIT": 305.0,
+            "HOME_CARER_CREDIT": 1950.0,
+            "SINGLE_CHILD_CARER_CREDIT": 1900.0,
             
             "SRCOP_SINGLE": 44000.0,
             "SRCOP_MARRIED_BASE": 53000.0,
@@ -76,7 +108,7 @@ class IrishTaxCalculator:
             cfg["PRSI_RATE"] = 0.041
         else: 
             cfg["USC_BAND_2_LIMIT"] = 28700.0
-            cfg["PRSI_RATE"] = 0.042
+            cfg["PRSI_RATE"] = 0.0435
             
         return cfg
 
@@ -132,19 +164,55 @@ class IrishTaxCalculator:
             return 0.0, 0.0
             
         rate = cfg["PRSI_RATE"]
-        return total_income * rate, rate
+        gross_prsi = total_income * rate
+        
+        # PRSI Step Effect (Taper Relief) on lower incomes
+        annual_credit = max(0.0, 624.0 - ((total_income - cfg["PRSI_THRESHOLD"]) / 6.0))
+        net_prsi = max(0.0, gross_prsi - annual_credit)
+        
+        prsi_marginal = rate
+        # If inside the taper zone, the marginal rate is actually higher because the credit drops
+        if annual_credit > 0.0:
+            prsi_marginal = rate + (1.0 / 6.0)
+            
+        return net_prsi, prsi_marginal
+
+    def _calculate_rent_credit(self) -> float:
+        rent_credit_cap = 2000.0 if self.marital_status in ["Married_1_Income", "Married_2_Incomes"] else 1000.0
+        return min(rent_credit_cap, self.annual_rent_paid * 0.20)
 
     def get_tax_credits(self, cfg: dict) -> float:
         credits = cfg["PERSONAL_CREDIT"]
-        credits += cfg["EMPLOYMENT_CREDIT"]
         
-        if self.age >= 65:
-            credits += cfg["AGE_CREDIT_SINGLE"]
+        if self.employment_type == "PAYE":
+            credits += cfg["EMPLOYMENT_CREDIT"]
+        elif self.employment_type == "Self-Employed":
+            credits += cfg["EARNED_INCOME_CREDIT"]
             
-        return credits + self.additional_tax_credits + self.rent_tax_credit
+        if self.marital_status in ["Married_1_Income", "Married_2_Incomes"]:
+            credits += cfg["PERSONAL_CREDIT"]  # Married gets €4000 personal credit
+            if self.age >= 65: credits += cfg["AGE_CREDIT_MARRIED"]
+            if self.is_blind: credits += cfg["BLIND_CREDIT_MARRIED"]
+        else:
+            if self.age >= 65: credits += cfg["AGE_CREDIT_SINGLE"]
+            if self.is_blind: credits += cfg["BLIND_CREDIT_SINGLE"]
+
+        if self.has_incapacitated_child: credits += cfg["INCAPACITATED_CHILD_CREDIT"]
+        if self.claims_home_carer: credits += cfg["HOME_CARER_CREDIT"]
+        if self.claims_single_child_carer: credits += cfg["SINGLE_CHILD_CARER_CREDIT"]
+        if self.claims_dependent_relative: credits += cfg["DEPENDENT_RELATIVE_CREDIT"]
+        
+        if 0 <= self.widowed_years_since <= 5:
+            credits += max(0, 3600.0 - (self.widowed_years_since * 360.0)) # Rough 5-year taper
+            
+        credits += self.employer_health_premium * 0.20
+        credits += self.qualifying_health_expenses * 0.20
+        
+        return credits + self.additional_tax_credits + self._calculate_rent_credit()
 
     def get_max_pension_limit(self) -> float:
-        limit_salary = min(self.gross_income, 115000.0)
+        total_remuneration = self.gross_income + self.bik + self.employer_health_premium
+        limit_salary = min(total_remuneration, 115000.0)
         
         if self.age < 30: pct = 0.15
         elif self.age < 40: pct = 0.20
@@ -168,11 +236,26 @@ class IrishTaxCalculator:
             
         cfg = self._get_tax_config()
         
-        # Shield variables cleanly off the top
-        taxable_base = max(0, self.gross_income - self.voucher_allocation - self.cycle_to_work - self.travel_pass)
+        # Shield variables cleanly off the top (Voucher is an employer top-up, not a salary deduction)
+        taxable_base = max(0, self.gross_income - self.cycle_to_work - self.travel_pass)
         
-        total_income_for_prsi_usc = taxable_base + self.bik
-        taxable_paye_income = max(0, total_income_for_prsi_usc - self.pension_contribution)
+        # Micro-generation relief
+        taxable_micro_gen = max(0, self.micro_generation_income - 400.0)
+        tax_free_micro_gen = min(self.micro_generation_income, 400.0)
+        
+        # Rent-a-room cliff-edge logic
+        if self.rent_a_room_income > 14000.0:
+            taxable_rent_a_room = self.rent_a_room_income
+            tax_free_rent_a_room = 0.0
+        else:
+            taxable_rent_a_room = 0.0
+            tax_free_rent_a_room = self.rent_a_room_income
+            
+        total_bik = self.bik + self.employer_health_premium
+        total_income_for_prsi_usc = taxable_base + total_bik + taxable_micro_gen + taxable_rent_a_room
+        
+        # Deeds of covenant and EIIS reduce PAYE income natively
+        taxable_paye_income = max(0, total_income_for_prsi_usc - self.pension_contribution - self.eiis_investment - self.deeds_of_covenant)
 
         srcop = self.get_srcop(cfg)
         tax_20_bracket = min(taxable_paye_income, srcop) * cfg["INCOME_TAX_STD_RATE"]
@@ -184,23 +267,46 @@ class IrishTaxCalculator:
         total_credits = self.get_tax_credits(cfg)
         net_income_tax = max(0, gross_income_tax - total_credits)
 
+        # Age Exemption Limit
+        if self.age >= 65:
+            exemption_limit = 36000.0 if self.marital_status in ["Married_1_Income", "Married_2_Incomes"] else 18000.0
+            if total_income_for_prsi_usc <= exemption_limit:
+                net_income_tax = 0.0
+            else:
+                # Marginal relief (cap tax at 40% of the difference over limit)
+                marginal_tax_cap = (total_income_for_prsi_usc - exemption_limit) * 0.40
+                net_income_tax = min(net_income_tax, marginal_tax_cap)
+
         prsi, prsi_marginal = self.calculate_prsi(total_income_for_prsi_usc, cfg)
         usc, usc_marginal = self.calculate_usc(total_income_for_prsi_usc, cfg)
 
         total_taxes = net_income_tax + prsi + usc
-        take_home = taxable_base - self.pension_contribution - total_taxes
+        
+        # Cash flow deductions (investments) plus bonus employer inputs
+        take_home = taxable_base - self.pension_contribution - self.eiis_investment - self.deeds_of_covenant - total_taxes 
+        take_home += tax_free_rent_a_room + tax_free_micro_gen + taxable_micro_gen + taxable_rent_a_room - self.qualifying_health_expenses
+        take_home += self.voucher_allocation
         
         marginal_overall_rate = marginal_income_tax_rate + prsi_marginal + usc_marginal
-        effective_rate = (total_taxes / self.gross_income) * 100
+        
+        # Effective rate against total gross inflow
+        total_gross_inflow = self.gross_income + self.rent_a_room_income + self.micro_generation_income + self.voucher_allocation
+        effective_rate = (total_taxes / total_gross_inflow) * 100 if total_gross_inflow > 0 else 0.0
 
         return {
             "Core Financials": {
                 "Gross Compensatory Value": self.gross_income,
+                "Rent-a-Room Income": self.rent_a_room_income,
+                "Micro-generation Income": self.micro_generation_income,
                 "Voucher Allocation": self.voucher_allocation,
                 "Cycle to Work": self.cycle_to_work,
                 "Travel Pass": self.travel_pass,
                 "Pension Deduction": self.pension_contribution,
+                "EIIS Investment": self.eiis_investment,
+                "Deeds of Covenant": self.deeds_of_covenant,
+                "Out-of-Pocket Health Expenses": self.qualifying_health_expenses,
                 "Benefits In Kind (BIK)": self.bik,
+                "Employer Health Premium (BIK)": self.employer_health_premium,
             },
             "Tax Deductions": {
                 "Gross Income Tax": round(gross_income_tax, 2),
@@ -208,13 +314,18 @@ class IrishTaxCalculator:
                 "Net Income Tax (PAYE)": round(net_income_tax, 2),
                 "USC": round(usc, 2),
                 "PRSI": round(prsi, 2),
-                "Rent Tax Credit": round(self.rent_tax_credit, 2),
+                "Rent Tax Credit (20%)": round(self._calculate_rent_credit(), 2),
                 "Cycle to Work": round(self.cycle_to_work, 2),
-                "Travel Pass": round(self.travel_pass, 2)
+                "Travel Pass": round(self.travel_pass, 2),
+                "EIIS Deduction": round(self.eiis_investment, 2),
+                "Deeds of Covenant Deduction": round(self.deeds_of_covenant, 2),
+                "Health Expenses Relief (20%)": round(self.qualifying_health_expenses * 0.20, 2),
+                "Health Insurance Relief (20%)": round(self.employer_health_premium * 0.20, 2)
             },
             "Summary": {
                 "Total Tax Deduced": round(total_taxes, 2),
                 "Take Home CASH": round(take_home, 2),
+                "_raw_take_home": take_home,
                 "Effective Tax Rate (%)": round(effective_rate, 2),
                 "Marginal Tax Rate (%)": round(marginal_overall_rate * 100, 2)
             }
@@ -222,71 +333,92 @@ class IrishTaxCalculator:
 
     def _build_empty_response(self) -> dict:
         return {
-            "Core Financials": {"Gross Compensatory Value": 0.0, "Voucher Allocation": 0.0, "Cycle to Work": 0.0, "Travel Pass": 0.0, "Pension Deduction": 0.0, "Benefits In Kind (BIK)": 0.0},
-            "Tax Deductions": {"Gross Income Tax": 0.0, "Tax Credits Applied": 0.0, "Net Income Tax (PAYE)": 0.0, "USC": 0.0, "PRSI": 0.0, "Rent Tax Credit": 0.0, "Cycle to Work": 0.0, "Travel Pass": 0.0},
-            "Summary": {"Total Tax Deduced": 0.0, "Take Home CASH": 0.0, "Effective Tax Rate (%)": 0.0, "Marginal Tax Rate (%)": 0.0}
+            "Core Financials": {"Gross Compensatory Value": 0.0, "Rent-a-Room Income": 0.0, "Micro-generation Income": 0.0, "Voucher Allocation": 0.0, "Cycle to Work": 0.0, "Travel Pass": 0.0, "Pension Deduction": 0.0, "EIIS Investment": 0.0, "Deeds of Covenant": 0.0, "Out-of-Pocket Health Expenses": 0.0, "Benefits In Kind (BIK)": 0.0, "Employer Health Premium (BIK)": 0.0},
+            "Tax Deductions": {"Gross Income Tax": 0.0, "Tax Credits Applied": 0.0, "Net Income Tax (PAYE)": 0.0, "USC": 0.0, "PRSI": 0.0, "Rent Tax Credit (20%)": 0.0, "Cycle to Work": 0.0, "Travel Pass": 0.0, "EIIS Deduction": 0.0, "Deeds of Covenant Deduction": 0.0, "Health Expenses Relief (20%)": 0.0, "Health Insurance Relief (20%)": 0.0},
+            "Summary": {"Total Tax Deduced": 0.0, "Take Home CASH": 0.0, "_raw_take_home": 0.0, "Effective Tax Rate (%)": 0.0, "Marginal Tax Rate (%)": 0.0}
         }
 
-    def _objective_function(self, x, utility_weight_pension: float, utility_weight_voucher: float, utility_weight_cycle: float, utility_weight_travel: float) -> float:
+    def _objective_function(self, x, utility_weight_pension: float, utility_weight_cycle: float, utility_weight_travel: float, utility_weight_eiis: float, utility_weight_deeds: float) -> float:
         self.pension_contribution = x[0]
-        self.voucher_allocation = x[1]
-        self.cycle_to_work = x[2]
-        self.travel_pass = x[3]
+        self.cycle_to_work = x[1]
+        self.travel_pass = x[2]
+        self.eiis_investment = x[3]
+        self.deeds_of_covenant = x[4]
         
         result = self.calculate()
-        take_home_cash = result["Summary"]["Take Home CASH"]
+        take_home_cash = result["Summary"]["_raw_take_home"]
         
         utility_pension = utility_weight_pension * self.pension_contribution
-        utility_voucher = utility_weight_voucher * self.voucher_allocation
         utility_cycle = utility_weight_cycle * self.cycle_to_work
         utility_travel = utility_weight_travel * self.travel_pass
+        utility_eiis = utility_weight_eiis * self.eiis_investment
+        utility_deeds = utility_weight_deeds * self.deeds_of_covenant
         
-        total_utility = take_home_cash + utility_pension + utility_voucher + utility_cycle + utility_travel
+        # Voucher is omitted as it is purely additive and doesn't drain liquidity
+        total_utility = take_home_cash + utility_pension + utility_cycle + utility_travel + utility_eiis + utility_deeds
         return -total_utility
 
-    def optimize(self, utility_weight_pension=1.2, utility_weight_voucher=0.90, utility_weight_cycle=0.85, utility_weight_travel=0.95):
+    def optimize(self, utility_weight_pension=1.2, utility_weight_cycle=0.85, utility_weight_travel=0.95, utility_weight_eiis=0.8, utility_weight_deeds=1.0):
         max_pension = self.get_max_pension_limit()
-        max_voucher = 1000.0  
         max_cycle = self.get_max_cycle_to_work_limit()
-        max_travel = 1830.0  # Max travel pass exclusion currently around this bracket
+        max_travel = 1830.0  
+        max_eiis = 500000.0
+        max_deeds = (self.gross_income + self.rent_a_room_income + self.micro_generation_income) * 0.05
         
         bounds = [
-            (0.0, max_pension),
-            (0.0, max_voucher),
-            (0.0, max_cycle),
-            (0.0, max_travel)
+            (0.0, max_pension),    # x[0]
+            (0.0, max_cycle),      # x[1]
+            (0.0, max_travel),     # x[2]
+            (0.0, max_eiis),       # x[3]
+            (0.0, max_deeds)       # x[4]
         ]
         
-        x0 = [10.0, 10.0, 10.0, 10.0]
+        def liquidity_constraint(x):
+            self.pension_contribution = x[0]
+            self.cycle_to_work = x[1]
+            self.travel_pass = x[2]
+            self.eiis_investment = x[3]
+            self.deeds_of_covenant = x[4]
+            return self.calculate()["Summary"]["_raw_take_home"]
+
+        constraints = ({'type': 'ineq', 'fun': liquidity_constraint})
+        
+        x0 = [10.0, 10.0, 10.0, 10.0, 10.0]
         
         res = minimize(
-            lambda x: self._objective_function(x, utility_weight_pension, utility_weight_voucher, utility_weight_cycle, utility_weight_travel), 
+            lambda x: self._objective_function(x, utility_weight_pension, utility_weight_cycle, utility_weight_travel, utility_weight_eiis, utility_weight_deeds), 
             x0,
             bounds=bounds,
-            method='Powell'
+            constraints=constraints,
+            method='SLSQP'
         )
         
         if res.success:
             self.pension_contribution = res.x[0]
-            self.voucher_allocation = res.x[1]
-            self.cycle_to_work = res.x[2]
-            self.travel_pass = res.x[3]
+            self.cycle_to_work = res.x[1]
+            self.travel_pass = res.x[2]
+            self.eiis_investment = res.x[3]
+            self.deeds_of_covenant = res.x[4]
+            
             final_result = self.calculate()
             
             print(json.dumps(final_result, indent=4))
             print("\n" + "="*50)
             print("MULTIDIMENSIONAL UTILITY OPTIMIZATION RESULT:")
             print(f"Optimal Pension Allocation: €{round(self.pension_contribution, 2)} (Bound: €{round(max_pension,2)})")
-            print(f"Optimal Voucher Allocation: €{round(self.voucher_allocation, 2)} (Bound: €{round(max_voucher,2)})")
             print(f"Optimal Cycle to Work Allocation: €{round(self.cycle_to_work, 2)} (Bound: €{round(max_cycle,2)})")
             print(f"Optimal Travel Pass Allocation: €{round(self.travel_pass, 2)} (Bound: €{round(max_travel,2)})")
+            print(f"Optimal EIIS Investment: €{round(self.eiis_investment, 2)} (Bound: €{round(max_eiis,2)})")
+            print(f"Optimal Deeds of Covenant: €{round(self.deeds_of_covenant, 2)} (Bound: €{round(max_deeds,2)})")
+            print(f"Manually Input Voucher Allocation: €{round(self.voucher_allocation, 2)} (Bypassed Optimizer)")
             print(f"- Pension utility metric: {utility_weight_pension}")
-            print(f"- Voucher utility metric: {utility_weight_voucher}")
             print(f"- Cycle utility metric: {utility_weight_cycle}")
             print(f"- Travel pass utility metric: {utility_weight_travel}")
+            print(f"- EIIS utility metric: {utility_weight_eiis}")
+            print(f"- Deeds utility metric: {utility_weight_deeds}")
             print("="*50 + "\n")
         else:
-            print("Bounded multidimensional optimization failed.")
+            print("Bounded multidimensional optimization failed.", res.message)
 
     def marginal_rate_curve(self, max_income: float = 200_000, step: float = 500) -> list[dict]:
         curve = []
@@ -353,11 +485,13 @@ if __name__ == "__main__":
         cycle_type="ebike",
         cycle_to_work_mode="annual",
         bik=0.0,
+        employer_health_premium=1200.0,
         employment_type="PAYE",
         marital_status="Single",
         medical_card=False,
-        rent_tax_credit=1000.0
+        annual_rent_paid=500.0,
+        qualifying_health_expenses=600.0
     )
 
-    # Note: Using high utility weights to show boundary locking
-    calc.optimize(utility_weight_pension=1.2, utility_weight_voucher=0.90, utility_weight_cycle=0.85, utility_weight_travel=0.0)
+    # Calling optimization to ensure bounds behavior applies cleanly on fixed BIK
+    calc.optimize(utility_weight_pension=1.2, utility_weight_cycle=0.85, utility_weight_travel=0.0)
