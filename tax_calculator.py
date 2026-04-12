@@ -77,6 +77,12 @@ class UserProfile:
     claims_dependent_relative: bool = False
     widowed_years_since: int = -1
     tax_year: int = 2026
+    remote_working_days: int = 0
+    annual_wfh_utility_costs: float = 0.0
+    qualifying_tuition_fees: float = 0.0
+    flat_rate_expense: float = 0.0
+    nursing_home_fees: float = 0.0
+    employee_health_insurance: float = 0.0
 
 @dataclass
 class Investments:
@@ -86,6 +92,8 @@ class Investments:
     cycle_type: str = "regular"
     cycle_to_work_mode: str = "annual"
     travel_pass: float = 0.0
+    income_protection_premium: float = 0.0
+    charitable_donations: float = 0.0
     eiis_investment: float = 0.0
     deeds_of_covenant: float = 0.0
 
@@ -198,7 +206,7 @@ class IrishTaxCalculator:
         return min(rent_credit_cap, profile.annual_rent_paid * 0.20)
 
     @staticmethod
-    def get_tax_credits(profile: UserProfile, cfg: dict) -> float:
+    def get_tax_credits(profile: UserProfile, investments: Investments, cfg: dict) -> float:
         """
         Tax credits are subtracted directly from your gross income tax bill (not from 
         taxable income). Every taxpayer gets a Personal Credit (€2,000). PAYE workers get 
@@ -236,6 +244,11 @@ class IrishTaxCalculator:
             
         credits += profile.employer_health_premium * 0.20
         credits += profile.qualifying_health_expenses * 0.20
+        credits += profile.nursing_home_fees * 0.20
+        credits += profile.employee_health_insurance * 0.20
+        credits += IrishTaxCalculator.calculate_remote_working_relief(profile)
+        credits += IrishTaxCalculator.calculate_tuition_fees_relief(profile)
+        credits += IrishTaxCalculator.calculate_income_protection_relief(profile, investments)
         
         return credits + profile.additional_tax_credits + IrishTaxCalculator._calculate_rent_credit(profile)
 
@@ -295,7 +308,54 @@ class IrishTaxCalculator:
         if income > 14000.0:
             return income, 0.0
         return 0.0, income
-        
+
+    @staticmethod
+    def calculate_remote_working_relief(profile: UserProfile) -> float:
+        """
+        E-Working (Remote Working) tax relief. Revenue allows employees who work from 
+        home to claim 30% of their vouched electricity, heating, and broadband costs 
+        proportional to the number of days worked remotely. The calculation is:
+        (annual_wfh_utility_costs / 365) * remote_working_days * 0.30.
+        This is then applied as a flat income tax credit at 20%, meaning the actual credit 
+        is 20% of the 30% deductible amount. Example: €2,000 utility bill, 200 WFH days 
+        -> deductible = (2000/365) * 200 * 0.30 = €328.77 -> credit = €328.77 * 0.20 = €65.75.
+        """
+        if profile.remote_working_days <= 0 or profile.annual_wfh_utility_costs <= 0:
+            return 0.0
+        daily_cost = profile.annual_wfh_utility_costs / 365.0
+        deductible_amount = daily_cost * profile.remote_working_days * 0.30
+        return deductible_amount * 0.20
+
+    @staticmethod
+    def calculate_tuition_fees_relief(profile: UserProfile) -> float:
+        """
+        Tuition Fees Relief: 20% tax credit on qualifying third-level tuition fees paid 
+        to approved institutions. A disregard amount of €3,000 per course (full-time) is 
+        subtracted first — you get no relief on the first €3,000. The maximum qualifying 
+        fee per person is €7,000. So the maximum credit is (€7,000 - €3,000) * 0.20 = €800.
+        If you pay €5,000 in tuition, the credit is (€5,000 - €3,000) * 0.20 = €400.
+        If you pay €2,500, the credit is €0 (below the disregard threshold).
+        """
+        if profile.qualifying_tuition_fees <= 3000.0:
+            return 0.0
+        qualifying_amount = min(profile.qualifying_tuition_fees, 7000.0) - 3000.0
+        return qualifying_amount * 0.20
+
+    @staticmethod
+    def calculate_income_protection_relief(profile: UserProfile, investments: Investments) -> float:
+        """
+        Permanent Health Insurance (Income Protection) relief. Premiums paid for a 
+        qualifying income protection policy receive 20% tax relief. The maximum 
+        qualifying premium is capped at 10% of total income. For example, on a €50,000 
+        salary the max relievable premium is €5,000. If you pay €1,200/year in premiums, 
+        the credit is €1,200 * 0.20 = €240 off your tax bill. You keep the insurance coverage.
+        """
+        if investments.income_protection_premium <= 0:
+            return 0.0
+        max_qualifying = profile.gross_income * 0.10
+        qualifying = min(investments.income_protection_premium, max_qualifying)
+        return qualifying * 0.20
+
     @staticmethod
     def calculate_gross_income_tax(taxable_paye_income: float, srcop: float, cfg: dict) -> tuple[float, float]:
         """
@@ -332,11 +392,12 @@ class IrishTaxCalculator:
     def calculate_taxable_base(profile: UserProfile, investments: Investments) -> float:
         """
         Starting point for all tax calculations. Takes gross salary and subtracts 
-        legitimate pre-tax salary sacrifice schemes (Cycle to Work, Travel Pass). 
-        The voucher is excluded here because it is an employer-side tax-free benefit, 
-        not a salary deduction. The result is the income base that flows into PAYE/USC/PRSI.
+        legitimate pre-tax salary sacrifice schemes (Cycle to Work, Travel Pass) and 
+        Flat Rate Expenses (occupation-specific Revenue-approved deduction that reduces 
+        taxable income directly, not as a credit). The voucher is excluded here because 
+        it is an employer-side tax-free benefit, not a salary deduction.
         """
-        return max(0, profile.gross_income - investments.cycle_to_work - investments.travel_pass)
+        return max(0, profile.gross_income - investments.cycle_to_work - investments.travel_pass - profile.flat_rate_expense)
 
     @staticmethod
     def calculate_total_income(taxable_base: float, profile: UserProfile) -> float:
@@ -352,29 +413,46 @@ class IrishTaxCalculator:
         return taxable_base + total_bik + taxable_micro_gen + taxable_rent_a_room
 
     @staticmethod
-    def calculate_taxable_paye_income(total_income: float, investments: Investments) -> float:
+    def calculate_charitable_deduction(profile: UserProfile, investments: Investments) -> float:
+        """
+        Section 848A charitable donation relief. Only donations of €250 or more to approved 
+        bodies qualify. For self-employed taxpayers, the donation is deducted directly from 
+        taxable income (saving at marginal rate). For PAYE workers, the charity claims the 
+        tax back from Revenue — the donor gets no direct deduction. The maximum qualifying 
+        donation is €1,000,000 per year. Returns the deductible amount (0 for PAYE workers).
+        """
+        if investments.charitable_donations < 250.0:
+            return 0.0
+        if profile.employment_type != "Self-Employed":
+            return 0.0
+        return min(investments.charitable_donations, 1000000.0)
+
+    @staticmethod
+    def calculate_taxable_paye_income(total_income: float, investments: Investments, profile: UserProfile) -> float:
         """
         Income subject to PAYE income tax brackets. This is total income minus 
         tax-deductible investments: pension contributions (up to age-based limit), 
-        EIIS investments (tax relief at marginal rate), and Deeds of Covenant (up to 5% 
-        of total income). These deductions push income down the bracket ladder, potentially 
-        moving euros from the 40% band back into the 20% band.
+        EIIS investments (tax relief at marginal rate), Deeds of Covenant (up to 5% 
+        of total income), and charitable donations (self-employed only, €250 minimum). 
+        These deductions push income down the bracket ladder, potentially moving euros 
+        from the 40% band back into the 20% band.
         """
-        return max(0, total_income - investments.pension_contribution - investments.eiis_investment - investments.deeds_of_covenant)
+        charitable = IrishTaxCalculator.calculate_charitable_deduction(profile, investments)
+        return max(0, total_income - investments.pension_contribution - investments.eiis_investment - investments.deeds_of_covenant - charitable)
 
     @staticmethod
-    def calculate_net_income_tax(profile: UserProfile, taxable_paye_income: float, total_income: float, cfg: dict) -> tuple[float, float, float, float]:
+    def calculate_net_income_tax(profile: UserProfile, investments: Investments, taxable_paye_income: float, total_income: float, cfg: dict) -> tuple[float, float, float, float]:
         """
         Orchestrates the full income tax pipeline:
         1. Calculates gross income tax by applying the 20%/40% brackets to taxable PAYE income.
-        2. Sums all applicable tax credits (personal, employment, medical, rent, etc.).
+        2. Sums all applicable tax credits (personal, employment, medical, rent, income protection, etc.).
         3. Subtracts credits from gross tax (floored at zero) to get net income tax.
         4. Applies the age exemption override if the taxpayer is 65+.
         Returns (gross_income_tax, net_income_tax, total_credits, marginal_income_tax_rate).
         """
         srcop = IrishTaxCalculator.get_srcop(profile, cfg)
         gross_income_tax, marginal_income_tax_rate = IrishTaxCalculator.calculate_gross_income_tax(taxable_paye_income, srcop, cfg)
-        total_credits = IrishTaxCalculator.get_tax_credits(profile, cfg)
+        total_credits = IrishTaxCalculator.get_tax_credits(profile, investments, cfg)
         net_income_tax = max(0, gross_income_tax - total_credits)
         net_income_tax = IrishTaxCalculator.enforce_age_exemption(profile, total_income, net_income_tax)
         return gross_income_tax, net_income_tax, total_credits, marginal_income_tax_rate
@@ -394,9 +472,11 @@ class IrishTaxCalculator:
         taxable_micro_gen, _ = IrishTaxCalculator.split_micro_generation_income(profile.micro_generation_income)
         taxable_rent_a_room, tax_free_rent_a_room = IrishTaxCalculator.split_rent_a_room_income(profile.rent_a_room_income)
 
-        take_home = taxable_base - investments.pension_contribution - investments.eiis_investment - investments.deeds_of_covenant - total_taxes
+        take_home = taxable_base - investments.pension_contribution - investments.eiis_investment - investments.deeds_of_covenant - investments.charitable_donations - investments.income_protection_premium - total_taxes
         take_home += tax_free_rent_a_room + tax_free_micro_gen + taxable_micro_gen + taxable_rent_a_room
         take_home -= profile.qualifying_health_expenses
+        take_home -= profile.nursing_home_fees
+        take_home -= profile.employee_health_insurance
         take_home += investments.voucher_allocation
         return take_home
 
@@ -438,10 +518,15 @@ class IrishTaxCalculator:
                 "Rent Tax Credit (20%)": round(IrishTaxCalculator._calculate_rent_credit(profile), 2),
                 "Cycle to Work": round(investments.cycle_to_work, 2),
                 "Travel Pass": round(investments.travel_pass, 2),
+                "Income Protection Relief (20%)": round(IrishTaxCalculator.calculate_income_protection_relief(profile, investments), 2),
+                "Nursing Home Fees Relief (20%)": round(profile.nursing_home_fees * 0.20, 2),
+                "Employee Health Insurance Relief (20%)": round(profile.employee_health_insurance * 0.20, 2),
+                "Charitable Donations": round(investments.charitable_donations, 2),
+                "Charitable Deduction (Self-Employed)": round(IrishTaxCalculator.calculate_charitable_deduction(profile, investments), 2),
                 "EIIS Deduction": round(investments.eiis_investment, 2),
                 "Deeds of Covenant Deduction": round(investments.deeds_of_covenant, 2),
                 "Health Expenses Relief (20%)": round(profile.qualifying_health_expenses * 0.20, 2),
-                "Health Insurance Relief (20%)": round(profile.employer_health_premium * 0.20, 2)
+                "Employer Health Insurance Relief (20%)": round(profile.employer_health_premium * 0.20, 2)
             },
             "Summary": {
                 "Total Tax Deduced": round(total_taxes, 2),
@@ -473,9 +558,9 @@ class IrishTaxCalculator:
 
         taxable_base = IrishTaxCalculator.calculate_taxable_base(profile, investments)
         total_income = IrishTaxCalculator.calculate_total_income(taxable_base, profile)
-        taxable_paye_income = IrishTaxCalculator.calculate_taxable_paye_income(total_income, investments)
+        taxable_paye_income = IrishTaxCalculator.calculate_taxable_paye_income(total_income, investments, profile)
 
-        gross_income_tax, net_income_tax, total_credits, marginal_income_tax_rate = IrishTaxCalculator.calculate_net_income_tax(profile, taxable_paye_income, total_income, cfg)
+        gross_income_tax, net_income_tax, total_credits, marginal_income_tax_rate = IrishTaxCalculator.calculate_net_income_tax(profile, investments, taxable_paye_income, total_income, cfg)
         prsi, prsi_marginal = IrishTaxCalculator.calculate_prsi(profile, total_income, cfg)
         usc, usc_marginal = IrishTaxCalculator.calculate_usc(profile, total_income, cfg)
 
@@ -490,26 +575,23 @@ class IrishTaxCalculator:
     def _build_empty_response() -> dict:
         return {
             "Core Financials": {"Gross Compensatory Value": 0.0, "Rent-a-Room Income": 0.0, "Micro-generation Income": 0.0, "Voucher Allocation": 0.0, "Cycle to Work": 0.0, "Travel Pass": 0.0, "Pension Deduction": 0.0, "EIIS Investment": 0.0, "Deeds of Covenant": 0.0, "Out-of-Pocket Health Expenses": 0.0, "Benefits In Kind (BIK)": 0.0, "Employer Health Premium (BIK)": 0.0},
-            "Tax Deductions": {"Gross Income Tax": 0.0, "Tax Credits Applied": 0.0, "Net Income Tax (PAYE)": 0.0, "USC": 0.0, "PRSI": 0.0, "Rent Tax Credit (20%)": 0.0, "Cycle to Work": 0.0, "Travel Pass": 0.0, "EIIS Deduction": 0.0, "Deeds of Covenant Deduction": 0.0, "Health Expenses Relief (20%)": 0.0, "Health Insurance Relief (20%)": 0.0},
+            "Tax Deductions": {"Gross Income Tax": 0.0, "Tax Credits Applied": 0.0, "Net Income Tax (PAYE)": 0.0, "USC": 0.0, "PRSI": 0.0, "Rent Tax Credit (20%)": 0.0, "Cycle to Work": 0.0, "Travel Pass": 0.0, "Income Protection Relief (20%)": 0.0, "Nursing Home Fees Relief (20%)": 0.0, "Employee Health Insurance Relief (20%)": 0.0, "Charitable Donations": 0.0, "Charitable Deduction (Self-Employed)": 0.0, "EIIS Deduction": 0.0, "Deeds of Covenant Deduction": 0.0, "Health Expenses Relief (20%)": 0.0, "Employer Health Insurance Relief (20%)": 0.0},
             "Summary": {"Total Tax Deduced": 0.0, "Take Home CASH": 0.0, "_raw_take_home": 0.0, "Effective Tax Rate (%)": 0.0, "Marginal Tax Rate (%)": 0.0}
         }
 
     @staticmethod
-    def _objective_function(x, profile: UserProfile, base_investments: Investments, utility_weight_pension: float, utility_weight_cycle: float, utility_weight_travel: float, utility_weight_eiis: float, utility_weight_deeds: float) -> float:
+    def _objective_function(x, profile: UserProfile, base_investments: Investments, utility_weight_pension: float, utility_weight_cycle: float, utility_weight_travel: float, utility_weight_income_protection: float) -> float:
         """
         SciPy minimizes this function. We negate total_utility so minimization = maximization.
         Total utility = raw take-home cash + weighted value of each investment.
-        A utility weight of 1.2 on pension means €1 in pension is valued at €1.20 of utility 
-        (reflecting the forced savings + employer match value). A weight of 0.0 means the 
-        optimizer will never allocate to that lever. The voucher is excluded because it is 
-        a fixed employer-side input that does not drain the employee's liquidity.
+        4 levers are optimized (pension, cycle, travel, income protection). All other 
+        investment fields are passed through from base_investments unchanged.
         """
         investments = replace(base_investments, 
             pension_contribution = x[0],
             cycle_to_work = x[1],
             travel_pass = x[2],
-            eiis_investment = x[3],
-            deeds_of_covenant = x[4]
+            income_protection_premium = x[3]
         )
         
         result = IrishTaxCalculator.calculate(profile, investments)
@@ -518,30 +600,28 @@ class IrishTaxCalculator:
         utility_pension = utility_weight_pension * investments.pension_contribution
         utility_cycle = utility_weight_cycle * investments.cycle_to_work
         utility_travel = utility_weight_travel * investments.travel_pass
-        utility_eiis = utility_weight_eiis * investments.eiis_investment
-        utility_deeds = utility_weight_deeds * investments.deeds_of_covenant
+        utility_ip = utility_weight_income_protection * investments.income_protection_premium
         
-        total_utility = take_home_cash + utility_pension + utility_cycle + utility_travel + utility_eiis + utility_deeds
+        total_utility = take_home_cash + utility_pension + utility_cycle + utility_travel + utility_ip
         return -total_utility
 
     @staticmethod
-    def optimize(profile: UserProfile, base_investments: Investments, required_liquid_cash: float = 0.0, utility_weight_pension=1.2, utility_weight_cycle=0.85, utility_weight_travel=0.95, utility_weight_eiis=0.8, utility_weight_deeds=1.0) -> Investments:
+    def optimize(profile: UserProfile, base_investments: Investments, required_liquid_cash: float = 0.0, utility_weight_pension=1.2, utility_weight_cycle=0.85, utility_weight_travel=0.95, utility_weight_income_protection=0.0) -> Investments:
         """
-        Multidimensional optimizer using SciPy SLSQP (Sequential Least Squares Programming).
-        Finds the optimal allocation across 5 investment levers that maximizes total utility 
-        (take-home cash + weighted investment value) subject to two constraints:
-        1. Each lever is bounded by its legal maximum (e.g. pension by age-based NRE limit).
-        2. A liquidity constraint ensures take-home cash never drops below required_liquid_cash.
-        Before running, it checks if required_liquid_cash is even achievable by computing 
-        max_possible_cash with zero investments. If not, it rejects immediately.
+        Multidimensional optimizer using SciPy SLSQP. Finds optimal allocation across 
+        4 investment levers (pension, cycle to work, travel pass, income protection) 
+        that maximizes total utility. All other fields (EIIS, deeds, charitable, voucher) 
+        are passed through unchanged from base_investments.
+        Constraints:
+        1. Each lever is bounded by its legal maximum.
+        2. A liquidity constraint ensures take-home >= required_liquid_cash.
         Uses _raw_take_home (unrounded) for gradient continuity.
         """
         zero_investments = replace(base_investments,
             pension_contribution = 0.0,
             cycle_to_work = 0.0,
             travel_pass = 0.0,
-            eiis_investment = 0.0,
-            deeds_of_covenant = 0.0
+            income_protection_premium = 0.0
         )
         max_possible_cash = IrishTaxCalculator.calculate(profile, zero_investments)["Summary"]["_raw_take_home"]
         
@@ -555,16 +635,14 @@ class IrishTaxCalculator:
 
         max_pension = IrishTaxCalculator.get_max_pension_limit(profile)
         max_cycle = IrishTaxCalculator.get_max_cycle_to_work_limit(base_investments)
-        max_travel = 1830.0  
-        max_eiis = 500000.0
-        max_deeds = (profile.gross_income + profile.rent_a_room_income + profile.micro_generation_income) * 0.05
+        max_travel = 1830.0
+        max_ip = profile.gross_income * 0.10
         
         bounds = [
             (0.0, max_pension),
             (0.0, max_cycle),
             (0.0, max_travel),
-            (0.0, max_eiis),
-            (0.0, max_deeds)
+            (0.0, max_ip)
         ]
         
         def liquidity_constraint(x):
@@ -572,17 +650,16 @@ class IrishTaxCalculator:
                 pension_contribution = x[0],
                 cycle_to_work = x[1],
                 travel_pass = x[2],
-                eiis_investment = x[3],
-                deeds_of_covenant = x[4]
+                income_protection_premium = x[3]
             )
             return IrishTaxCalculator.calculate(profile, investments)["Summary"]["_raw_take_home"] - required_liquid_cash
 
         constraints = ({'type': 'ineq', 'fun': liquidity_constraint})
         
-        x0 = [10.0, 10.0, 10.0, 10.0, 10.0]
+        x0 = [10.0, 10.0, 10.0, 10.0]
         
         res = minimize(
-            lambda x: IrishTaxCalculator._objective_function(x, profile, base_investments, utility_weight_pension, utility_weight_cycle, utility_weight_travel, utility_weight_eiis, utility_weight_deeds), 
+            lambda x: IrishTaxCalculator._objective_function(x, profile, base_investments, utility_weight_pension, utility_weight_cycle, utility_weight_travel, utility_weight_income_protection), 
             x0,
             bounds=bounds,
             constraints=constraints,
@@ -594,27 +671,27 @@ class IrishTaxCalculator:
                 pension_contribution = res.x[0],
                 cycle_to_work = res.x[1],
                 travel_pass = res.x[2],
-                eiis_investment = res.x[3],
-                deeds_of_covenant = res.x[4]
+                income_protection_premium = res.x[3]
             )
             final_result = IrishTaxCalculator.calculate(profile, optimal_investments)
             
             print(json.dumps(final_result, indent=4))
             print("\n" + "="*50)
-            print("MULTIDIMENSIONAL UTILITY OPTIMIZATION RESULT:")
+            print("OPTIMIZATION RESULT (4 Core Levers):")
             if required_liquid_cash > 0:
                 print(f"[CONSTRAINT ACTIVE] Minimum Liquidity Enforced: €{required_liquid_cash:,.2f}")
-            print(f"Optimal Pension Allocation: €{round(optimal_investments.pension_contribution, 2)} (Bound: €{round(max_pension,2)})")
-            print(f"Optimal Cycle to Work Allocation: €{round(optimal_investments.cycle_to_work, 2)} (Bound: €{round(max_cycle,2)})")
-            print(f"Optimal Travel Pass Allocation: €{round(optimal_investments.travel_pass, 2)} (Bound: €{round(max_travel,2)})")
-            print(f"Optimal EIIS Investment: €{round(optimal_investments.eiis_investment, 2)} (Bound: €{round(max_eiis,2)})")
-            print(f"Optimal Deeds of Covenant: €{round(optimal_investments.deeds_of_covenant, 2)} (Bound: €{round(max_deeds,2)})")
-            print(f"Manually Input Voucher Allocation: €{round(optimal_investments.voucher_allocation, 2)} (Bypassed Optimizer)")
-            print(f"- Pension utility metric: {utility_weight_pension}")
-            print(f"- Cycle utility metric: {utility_weight_cycle}")
-            print(f"- Travel pass utility metric: {utility_weight_travel}")
-            print(f"- EIIS utility metric: {utility_weight_eiis}")
-            print(f"- Deeds utility metric: {utility_weight_deeds}")
+            print(f"  Pension:             €{round(optimal_investments.pension_contribution, 2):>10} / €{round(max_pension, 2)} limit  (weight: {utility_weight_pension})")
+            print(f"  Cycle to Work:       €{round(optimal_investments.cycle_to_work, 2):>10} / €{round(max_cycle, 2)} limit  (weight: {utility_weight_cycle})")
+            print(f"  Travel Pass:         €{round(optimal_investments.travel_pass, 2):>10} / €{round(max_travel, 2)} limit  (weight: {utility_weight_travel})")
+            print(f"  Income Protection:   €{round(optimal_investments.income_protection_premium, 2):>10} / €{round(max_ip, 2)} limit  (weight: {utility_weight_income_protection})")
+            if base_investments.voucher_allocation > 0:
+                print(f"  Voucher:             €{round(optimal_investments.voucher_allocation, 2):>10}  (manual, bypassed optimizer)")
+            if base_investments.eiis_investment > 0:
+                print(f"  EIIS:                €{round(optimal_investments.eiis_investment, 2):>10}  (manual, passed through)")
+            if base_investments.deeds_of_covenant > 0:
+                print(f"  Deeds:               €{round(optimal_investments.deeds_of_covenant, 2):>10}  (manual, passed through)")
+            if base_investments.charitable_donations > 0:
+                print(f"  Charitable:          €{round(optimal_investments.charitable_donations, 2):>10}  (manual, passed through)")
             print("="*50 + "\n")
             return optimal_investments
         else:
@@ -679,32 +756,98 @@ class IrishTaxCalculator:
 
 if __name__ == "__main__":
     
+    # ╔══════════════════════════════════════════════════════════════════════╗
+    # ║  SECTION 1: WHO ARE YOU?                                           ║
+    # ║  Basic facts that determine your tax bands and credits.            ║
+    # ╚══════════════════════════════════════════════════════════════════════╝
     my_profile = UserProfile(
-        gross_income=49000.0,
-        age=24,
-        employment_type="PAYE",
-        marital_status="Single",
-        medical_card=False,
-        annual_rent_paid=500.0,
-        qualifying_health_expenses=600.0,
-        bik=0.0,
-        employer_health_premium=1200.0
+        gross_income=49000.0,                   # Annual gross salary
+        age=24,                                 # Your age (drives pension % limit + age exemptions at 65+)
+        employment_type="PAYE",                 # "PAYE" | "Self-Employed"
+        marital_status="Single",                # "Single" | "Married_1_Income" | "Married_2_Incomes"
+        second_income=0.0,                      # Spouse's income (only if Married_2_Incomes)
+        tax_year=2026,                          # 2025 or 2026 (selects statutory rates)
+
+    # ╔══════════════════════════════════════════════════════════════════════╗
+    # ║  SECTION 2: LIFE CIRCUMSTANCES (yes/no → automatic credits)        ║
+    # ║  Each True adds a fixed credit directly to your tax bill.          ║
+    # ║  These don't cost you anything — just tell the truth.              ║
+    # ╚══════════════════════════════════════════════════════════════════════╝
+        medical_card=False,                     # Full medical card? Reduces USC if income < €60k
+        is_blind=False,                         # Blind Person's Credit: €1,650 single / €2,500 married
+        has_incapacitated_child=False,           # Incapacitated Child Credit: €3,300
+        claims_home_carer=False,                # Home Carer Credit: €1,800 (spouse caring at home)
+        claims_single_child_carer=False,        # Single Person Child Carer Credit: €1,750
+        claims_dependent_relative=False,        # Dependent Relative Credit: €245
+        widowed_years_since=-1,                 # Years since widowed (0-5 for tapered credit, -1 = N/A)
+
+    # ╔══════════════════════════════════════════════════════════════════════╗
+    # ║  SECTION 3: EXPENSES YOU CAN CLAIM TAX RELIEF ON                   ║
+    # ║  Fill in what you actually spent. The engine calculates the relief. ║
+    # ║  These reduce your tax bill — you already spent the money.         ║
+    # ╚══════════════════════════════════════════════════════════════════════╝
+        annual_rent_paid=500.0,                 # Rent you pay → 20% credit, capped €1,000/€2,000
+        qualifying_health_expenses=600.0,       # GP visits, prescriptions, hospital → 20% credit
+        nursing_home_fees=0.0,                  # Nursing home/care facility for you or a relative → 20% credit
+        employee_health_insurance=0.0,          # Health insurance YOU pay (not employer) → 20% credit
+        qualifying_tuition_fees=0.0,            # Third-level fees → 20% credit above €3k, max €7k
+        remote_working_days=0,                  # Days worked from home this year
+        annual_wfh_utility_costs=0.0,           # Electricity + heating + broadband bill → 30% x days/365 x 20%
+        flat_rate_expense=0.0,                  # Revenue occupation deduction (nurse €733, teacher €518, etc.)
+
+    # ╔══════════════════════════════════════════════════════════════════════╗
+    # ║  SECTION 4: EMPLOYER BENEFITS (your employer provides these)       ║
+    # ║  These affect your taxable income. Fill in what applies.           ║
+    # ╚══════════════════════════════════════════════════════════════════════╝
+        bik=0.0,                                # Benefits in Kind: company car, preferential loans, etc.
+        employer_health_premium=1200.0,         # Employer-paid health insurance → 20% credit + adds to income
+
+    # ╔══════════════════════════════════════════════════════════════════════╗
+    # ║  SECTION 5: ANCILLARY INCOME STREAMS                               ║
+    # ║  Extra money coming in. Each has its own exemption rules.          ║
+    # ╚══════════════════════════════════════════════════════════════════════╝
+        rent_a_room_income=0.0,                 # Letting a room in your home → tax-free up to €14,000
+        micro_generation_income=0.0,            # Selling electricity back to grid → exempt up to €400
+
+    # ╔══════════════════════════════════════════════════════════════════════╗
+    # ║  SECTION 6: MANUAL OVERRIDES                                       ║
+    # ╚══════════════════════════════════════════════════════════════════════╝
+        additional_tax_credits=0.0,             # Any credits not modeled above (manual override)
     )
     
+    # ╔══════════════════════════════════════════════════════════════════════╗
+    # ║  SECTION 7: INVESTMENT LEVERS (things you choose to spend on)      ║
+    # ║  OPTIMIZED = the engine finds the best amount for you.            ║
+    # ║  MANUAL = you set the amount, engine just factors it in.          ║
+    # ╚══════════════════════════════════════════════════════════════════════╝
     my_investments = Investments(
-        pension_contribution=0.0,
-        voucher_allocation=0.0,
-        cycle_to_work=0.0,
-        travel_pass=0.0,
-        cycle_type="ebike",
-        cycle_to_work_mode="annual"
+        pension_contribution=0.0,               # OPTIMIZED: saves at marginal rate (20-40%), money locked in pension
+        cycle_to_work=0.0,                      # OPTIMIZED: pre-tax bike purchase, you keep the bike
+        cycle_type="ebike",                     # "ebike" (€3,000 cap) | "regular" (€1,500 cap)
+        cycle_to_work_mode="annual",            # "annual" (cap / 4 years) | "lump" (full cap this year)
+        travel_pass=0.0,                        # OPTIMIZED: pre-tax public transport pass
+        income_protection_premium=0.0,          # OPTIMIZED: 20% credit, capped at 10% of income. You keep the coverage.
+        voucher_allocation=0.0,                 # MANUAL: employer-side small benefit (up to €1,500)
+        charitable_donations=0.0,               # MANUAL: only deductible if Self-Employed + €250 minimum
+        eiis_investment=0.0,                    # MANUAL: Employment & Investment Incentive Scheme
+        deeds_of_covenant=0.0,                  # MANUAL: legal covenant payments (up to 5% of income)
     )
 
+    # ╔══════════════════════════════════════════════════════════════════════╗
+    # ║  SECTION 8: OPTIMIZER WEIGHTS (only for the 4 core levers)         ║
+    # ║  How much is €1 locked into each lever worth to you?              ║
+    # ║    > 1.0 = worth MORE than cash (e.g. pension with employer match) ║
+    # ║    = 1.0 = worth SAME as cash                                     ║
+    # ║    < 1.0 = worth LESS than cash (e.g. bike you don't need)        ║
+    # ║    = 0.0 = don't allocate anything here                           ║
+    # ╚══════════════════════════════════════════════════════════════════════╝
     IrishTaxCalculator.optimize(
         my_profile, 
         my_investments, 
-        required_liquid_cash=38000.0,
-        utility_weight_pension=1.2, 
-        utility_weight_cycle=0.85, 
-        utility_weight_travel=0.0
+        required_liquid_cash=38000,               # Minimum take-home cash floor (0 = no floor)
+        utility_weight_pension=1.2,             # €1 pension = €1.20 of value to you
+        utility_weight_cycle=0.85,              # €1 bike = €0.85 of value to you
+        utility_weight_travel=0.0,              # €1 travel pass = €0.00 (disabled)
+        utility_weight_income_protection=0.0,   # €1 income protection = €0.00 (disabled, set 0.85+ to enable)
     )
+
